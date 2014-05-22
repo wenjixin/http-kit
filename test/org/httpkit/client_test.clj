@@ -11,7 +11,9 @@
   (:require [org.httpkit.client :as http]
             [clojure.java.io :as io]
             [clj-http.client :as clj-http])
-  (:import java.nio.ByteBuffer))
+  (:import java.nio.ByteBuffer
+           [org.httpkit HttpMethod HttpStatus HttpVersion]
+           [org.httpkit.client Decoder IRespListener]))
 
 (defroutes test-routes
   (GET "/get" [] "hello world")
@@ -48,7 +50,8 @@
   (ANY "/params" [] (fn [req] (-> req :params :param1)))
   (PUT "/body" [] (fn [req] {:body (:body req)
                             :status 200
-                            :headers {"content-type" "text/plain"}})))
+                            :headers {"content-type" "text/plain"}}))
+  (GET "/test-header" [] (fn [{:keys [headers]}] (str (get headers "test-header")))))
 
 (use-fixtures :once
   (fn [f]
@@ -297,6 +300,16 @@
                                   {:multipart [{:name "comment" :content "httpkit's project.clj"}
                                                {:name "file" :content (clojure.java.io/file "project.clj") :filename "project.clj"}]})))))
 
+
+(deftest test-coerce-req
+  "Headers should be the same regardless of multipart"
+  (let [coerce-req #'org.httpkit.client/coerce-req
+        request {:basic-auth ["user" "pass"]}]
+    (is (= (keys (:headers (coerce-req request)))
+           (remove #(= % "Content-Type")
+                   (keys (:headers (coerce-req (assoc request :multipart [{:name "foo" :content "bar"}])))))))))
+
+
 (deftest test-header-multiple-values
   (let [resp @(http/get "http://localhost:4347/multi-header" {:headers {"foo" ["bar" "baz"], "eggplant" "quux"}})
         resp2 (clj-http/get "http://localhost:4347/multi-header" {:headers {"foo" ["bar" "baz"], "eggplant" "quux"}})]
@@ -304,6 +317,102 @@
     (is (= 3 (-> resp :headers :x-method2 count)))
     (is (= 2 (-> resp :headers :x-method count)))
     (is (= 200 (:status resp2)))))
+
+(deftest test-headers-stringified
+  (doseq [[sent expected] [["test" "test"]
+                           [0 "0"]
+                           ['(0) "0"]
+                           ['("a" "b") "(\"a\" \"b\")"]]]
+    (let [received (:body @(http/get "http://localhost:4347/test-header"
+                             {:headers {"test-header" sent}}))]
+        (is (= received expected)))))
+
+(defn- utf8 [s] (ByteBuffer/wrap (.getBytes s "UTF-8")))
+
+(defn- decode
+  [method buffer]
+  (let [out (atom [])
+        listener (reify IRespListener
+                   (onInitialLineReceived [_ v s] (swap! out conj [:init v s]))
+                   (onHeadersReceived [_ hs]      (swap! out conj [:headers hs]))
+                   (onBodyReceived [_ buf n]      (swap! out conj [:body (into [] (take n buf))]))
+                   (onCompleted [_]               (swap! out conj [:completed]))
+                   (onThrowable [_ t]             (swap! out conj [:error t])))]
+    (.decode (Decoder. listener method) buffer)
+    @out))
+
+(deftest test-decode-partial-status-line
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; The Status-Line is only parsed once there is a CRLF in the end.
+    HttpMethod/GET "" []
+    HttpMethod/GET "HTTP/1.1" []
+    HttpMethod/GET "HTTP/1.1 200 OK" []
+    HttpMethod/GET "HTTP/1.1totally-broken-line" []))
+
+(deftest test-decode-http-version
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; HTTP version string is parsed.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+    HttpMethod/GET "HTTP/1.0 200 OK\r\n" [[:init HttpVersion/HTTP_1_0 HttpStatus/OK]]))
+
+(deftest test-decode-empty-reason-phrase
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; The Reason-Phrase (after Status-Code) may be omitted.
+    HttpMethod/GET "HTTP/1.1 200 \r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+
+    ;; A Status-Line with no space after the Status-Code does not comply to the RFC 2616,
+    ;; but there is probably little reason not to allow it in the parser.
+    HttpMethod/GET "HTTP/1.1 200\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]))
+
+(deftest test-decode-empty-headers
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Empty headers
+    HttpMethod/GET "HTTP/1.1 200 OK\r\n\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK] [:headers {}]]
+    HttpMethod/GET "HTTP/1.1 200 \r\n\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK] [:headers {}]]))
+
+(deftest test-decode-headers
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Headers are not emitted before two consecutive CRLF's
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+
+    ;; One header.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "0"}]]
+
+    ))
+
+(deftest test-decode-body
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Empty body with zero content-length, no matter what bytes follow.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n..."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "0"}]]
+
+    ;; Expecting one byte, but no content available yet.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "1"}]]
+
+     ;; One byte.
+     HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n."
+     [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+      [:headers {"content-length" "1"}]
+      [:body [46]]]
+
+     ;; One byte. The rest is ignored.
+     HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n..."
+     [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+      [:headers {"content-length" "1"}]
+      [:body [46]]]
+
+    ;; The body is omitted for HEAD requests.
+    HttpMethod/HEAD "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n..."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "3"}]]
+
+    ))
 
 ;; @(http/get "http://127.0.0.1:4348" {:headers {"Connection" "Close"}})
 

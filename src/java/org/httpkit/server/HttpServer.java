@@ -14,28 +14,48 @@ import static org.httpkit.HttpUtils.HttpEncode;
 import static org.httpkit.HttpUtils.WsEncode;
 import static org.httpkit.server.Frame.CloseFrame.*;
 
+class PendingKey {
+    public final SelectionKey key;
+    // operation: can be register for write or close the selectionkey
+    public final int Op;
+
+    PendingKey(SelectionKey key, int op) {
+        this.key = key;
+        Op = op;
+    }
+
+    public static final int OP_WRITE = -1;
+}
+
 public class HttpServer implements Runnable {
 
     static final String THREAD_NAME = "server-loop";
 
     private final IHandler handler;
-    private final int maxBody;
-    private final int maxLine;
+    private final int maxBody; // max http body size
+    private final int maxLine; // max header line size
+
+    private final int maxWs; // websocket, max message size
 
     private final Selector selector;
     private final ServerSocketChannel serverChannel;
 
+
     private Thread serverThread;
 
-    private final ConcurrentLinkedQueue<SelectionKey> pending = new ConcurrentLinkedQueue<SelectionKey>();
+    // queue operations from worker threads to the IO thread
+    private final ConcurrentLinkedQueue<PendingKey> pending = new ConcurrentLinkedQueue<PendingKey>();
+
     // shared, single thread
     private final ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 64);
 
-    public HttpServer(String ip, int port, IHandler handler, int maxBody, int maxLine)
+    public HttpServer(String ip, int port, IHandler handler, int maxBody, int maxLine, int maxWs)
             throws IOException {
         this.handler = handler;
         this.maxLine = maxLine;
         this.maxBody = maxBody;
+        this.maxWs = maxWs;
+
         this.selector = Selector.open();
         this.serverChannel = ServerSocketChannel.open();
         serverChannel.configureBlocking(false);
@@ -54,7 +74,7 @@ public class HttpServer implements Runnable {
                 atta.channel = new AsyncChannel(k, this);
             }
         } catch (Exception e) {
-            // too many open files. do not quit
+            // eg: too many open files. do not quit
             HttpUtils.printError("accept incoming request", e);
         }
     }
@@ -68,7 +88,7 @@ public class HttpServer implements Runnable {
         ServerAtta att = (ServerAtta) key.attachment();
         if (att instanceof HttpAtta) {
             handler.clientClose(att.channel, -1);
-        } else {
+        } else if (att != null) {
             handler.clientClose(att.channel, status);
         }
     }
@@ -81,7 +101,7 @@ public class HttpServer implements Runnable {
                 if (request != null) {
                     channel.reset(request);
                     if (request.isWebSocket) {
-                        key.attach(new WsAtta(channel));
+                        key.attach(new WsAtta(channel, maxWs));
                     } else {
                         atta.keepalive = request.isKeepAlive;
                     }
@@ -113,6 +133,9 @@ public class HttpServer implements Runnable {
                 } else if (frame instanceof PingFrame) {
                     atta.decoder.reset();
                     tryWrite(key, WsEncode(WSDecoder.OPCODE_PONG, frame.data));
+                } else if (frame instanceof PongFrame) {
+                    atta.decoder.reset();
+                    tryWrite(key, WsEncode(WSDecoder.OPCODE_PING, frame.data));
                 } else if (frame instanceof CloseFrame) {
                     handler.clientClose(atta.channel, ((CloseFrame) frame).getStatus());
                     // close the TCP connection after sent
@@ -207,18 +230,18 @@ public class HttpServer implements Runnable {
                                 atta.toWrites.add(b);
                             }
                         }
-                        pending.add(key);
+                        pending.add(new PendingKey(key, PendingKey.OP_WRITE));
                         selector.wakeup();
                     } else if (!atta.isKeepAlive()) {
-                        closeKey(key, CLOSE_NORMAL);
+                        pending.add(new PendingKey(key, CLOSE_NORMAL));
                     }
                 } catch (IOException e) {
-                    closeKey(key, CLOSE_AWAY);
+                    pending.add(new PendingKey(key, CLOSE_AWAY));
                 }
             } else {
                 // If has pending write, order should be maintained. (WebSocket)
                 Collections.addAll(atta.toWrites, buffers);
-                pending.add(key);
+                pending.add(new PendingKey(key, PendingKey.OP_WRITE));
                 selector.wakeup();
             }
         }
@@ -227,10 +250,14 @@ public class HttpServer implements Runnable {
     public void run() {
         while (true) {
             try {
-                SelectionKey k = null;
+                PendingKey k;
                 while ((k = pending.poll()) != null) {
-                    if (k.isValid()) {
-                        k.interestOps(OP_WRITE);
+                    if (k.Op == PendingKey.OP_WRITE) {
+                        if (k.key.isValid()) {
+                            k.key.interestOps(OP_WRITE);
+                        }
+                    } else {
+                        closeKey(k.key, k.Op);
                     }
                 }
                 if (selector.select() <= 0) {
@@ -268,26 +295,39 @@ public class HttpServer implements Runnable {
         serverThread.start();
     }
 
-    public void stopAccept() {
+    public void stop(int timeout) {
         try {
             serverChannel.close(); // stop accept any request
         } catch (IOException ignore) {
         }
-    }
 
-    public void stop() {
+        // wait all requests to finish, at most timeout milliseconds
+        handler.close(timeout);
+
+        // close socket, notify on-close handlers
         if (selector.isOpen()) {
+            Set<SelectionKey> t = selector.keys();
+            SelectionKey[] keys = t.toArray(new SelectionKey[t.size()]);
+            for (SelectionKey k : keys) {
+                /**
+                 * 1. t.toArray will fill null if given array is larger.
+                 * 2. compute t.size(), then try to fill the array, if in the mean time, another
+                 *    thread close one SelectionKey, will result a NPE
+                 *
+                 * https://github.com/http-kit/http-kit/issues/125
+                 */
+                if (k != null)
+                    closeKey(k, 0); // 0 => close by server
+            }
+
             try {
-                serverChannel.close();
-                Set<SelectionKey> keys = selector.keys();
-                for (SelectionKey k : keys) {
-                    k.channel().close();
-                }
                 selector.close();
-                handler.close(0);
             } catch (IOException ignore) {
             }
-            serverThread.interrupt();
         }
+    }
+
+    public int getPort() {
+        return this.serverChannel.socket().getLocalPort();
     }
 }

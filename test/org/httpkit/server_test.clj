@@ -122,7 +122,10 @@
                                       :body (str (:content-length req))}))
   (GET "/length" [] (fn [req]
                       (let [l (-> req :params :length to-int)]
-                        (subs const-string 0 l))))
+                        {:status 200
+                         ;; this is wrong, but server should correct it
+                         :headers {"content-length" 10000}
+                         :body (subs const-string 0 l)})))
   (GET "/null" [] (fn [req] {:status 200 :body nil}))
   (GET "/demo" [] streaming-demo)
 
@@ -196,6 +199,14 @@
 (deftest test-body-inputstream
   (doseq [length (range 1 (* 1024 1024 5) 1439987)] ; max 5m, many files
     (let [uri (str "http://localhost:4347/inputstream?l=" length)
+          resp (http/get uri)]
+      (is (= (:status resp) 200))
+      (is (= length (count (:body resp)))))))
+
+;; https://github.com/http-kit/http-kit/issues/127
+(deftest test-wrong-content-length
+  (doseq [length (range 1 1000 333)] ; max 5m, many files
+    (let [uri (str "http://localhost:4347/length?length=" length)
           resp (http/get uri)]
       (is (= (:status resp) 200))
       (is (= length (count (:body resp)))))))
@@ -329,7 +340,6 @@
                                                      :queue-size 102400}))
   (println "server started at 0.0.0.0:9090"))
 
-
 ;;; Test graceful shutdown
 (defn- slow-request-handler [sleep-time]
   (fn [request]
@@ -337,6 +347,11 @@
       (Thread/sleep sleep-time) {:body "ok"}
       (catch Exception e
         {:status 500}))))
+
+(deftest test-get-local-port
+  (let [server (run-server (site test-routes) {:port 0})]
+    (is (> (:local-port (meta server)) 0))
+    (server)))
 
 (deftest test-immediate-close-kills-inflight-requests
   (let [server (run-server (slow-request-handler 2000) {:port 3474})
